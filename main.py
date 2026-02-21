@@ -83,27 +83,29 @@ class NLOCNode:
         self.current_nonce = ""
         self.local_port = self.sock.getsockname()[1]
 
+    # ... (앞부분 동일) ...
+
     def start(self):
         pub_ip, pub_port = get_public_addr(self.sock)
-        # 중요: STUN 작업 끝났으니 타임아웃 해제 (Block 모드로 전환)
         self.sock.settimeout(None) 
         local_ip = get_local_ip()
         
         print(f"🌍 [WAN] {pub_ip}:{pub_port}")
         print(f"🏠 [LAN] {local_ip}:{self.local_port}")
-        print(f"\n🔗 이 정보를 상대방에게 입력하세요.")
 
         threading.Thread(target=self.receive_loop, daemon=True).start()
 
         peer_wan = input("\n상대방 공인 주소 (IP:Port): ").strip()
         peer_lan = input("상대방 사설 주소 (IP:Port): ").strip()
 
+        # 접속을 시도하는 쪽 (먼저 입력을 마친 쪽)
         for addr_str in [peer_wan, peer_lan]:
             if not addr_str or ":" not in addr_str: continue
             ip, port = addr_str.split(":")
-            self.sock.sendto(b"hello", (ip, int(port)))
-
-        print("🥊 펀칭 시도 중... 대화를 시작하려면 아무거나 입력하세요.")
+            target = (ip, int(port))
+            self.peer_addr = target
+            print(f"🥊 {target}로 'hello' 전송...")
+            self.sock.sendto(b"hello", target)
 
         while True:
             msg = input("")
@@ -121,48 +123,56 @@ class NLOCNode:
                 data, addr = self.sock.recvfrom(65535)
                 text = data.decode('utf-8', errors='ignore').strip()
                 
-                if not self.peer_addr:
-                    self.peer_addr = addr
-
+                # 1. 'hello'를 받으면 나는 Host가 되어 Challenge를 보냄
                 if text == "hello":
-                    self.peer_addr = addr # 통신이 먼저 닿은 주소로 고정
+                    self.peer_addr = addr
                     self.current_nonce = str(random.getrandbits(128))
                     challenge = {"type": "challenge", "nonce": self.current_nonce}
+                    print(f"\n📡 'hello' 수신 -> Challenge 전송 중...")
                     self.sock.sendto(json.dumps(challenge).encode(), addr)
                     continue
 
                 msg = json.loads(text)
                 m_type = msg.get("type")
 
+                # 2. Challenge를 받으면 나는 Client가 되어 Response를 보냄
                 if m_type == "challenge":
-                    print(f"\n📩 Challenge 수신 from {addr}")
+                    print(f"📩 Challenge 수신 from {addr} -> Response 전송 중...")
                     self.current_nonce = msg['nonce']
                     pk, ecdh_pk = self.crypto.get_public_keys_hex()
-                    response = {"type": "challengeResponse", "signature": self.crypto.sign(self.current_nonce), "publicKey": pk, "ecdhPublicKey": ecdh_pk}
+                    response = {
+                        "type": "challengeResponse", 
+                        "signature": self.crypto.sign(self.current_nonce), 
+                        "publicKey": pk, 
+                        "ecdhPublicKey": ecdh_pk
+                    }
                     self.sock.sendto(json.dumps(response).encode(), addr)
 
+                # 3. Response를 받으면 검증 후 AuthSuccess 전송
                 elif m_type == "challengeResponse":
-                    print(f"\n📩 Response 수신, 검증 중...")
+                    print(f"📩 Response 수신 -> 검증 및 AuthSuccess 전송...")
                     host_ecdh_pk = self.crypto.compute_shared_secret(msg['ecdhPublicKey'])
                     success = {"type": "authSuccess", "ecdhPublicKey": host_ecdh_pk}
                     self.sock.sendto(json.dumps(success).encode(), addr)
                     self.authenticated = True
                     self.peer_addr = addr
-                    print(f"✅ 인증 성공! ({addr})")
+                    print(f"✅ 인증 완료 (Master)! 상대방과 연결되었습니다.")
 
+                # 4. AuthSuccess를 받으면 최종 승인
                 elif m_type == "authSuccess":
+                    print(f"📩 AuthSuccess 수신!")
                     self.crypto.compute_shared_secret(msg['ecdhPublicKey'])
                     self.authenticated = True
                     self.peer_addr = addr
-                    print(f"✅ 인증 완료! (Path: {addr})")
+                    print(f"✅ 인증 완료 (Slave)! 암호화 채널이 열렸습니다.")
 
                 elif m_type == "encryptedPayload":
                     if self.crypto.session_key:
                         aesgcm = AESGCM(self.crypto.session_key)
                         decrypted = aesgcm.decrypt(bytes.fromhex(msg['nonce']), bytes.fromhex(msg['ciphertext']), None)
-                        print(f"\n🔐 [보안 수신] {decrypted.decode()}")
+                        print(f"\n🔐 [수신] {decrypted.decode()}")
 
-            except Exception:
+            except Exception as e:
                 continue
 
 if __name__ == "__main__":
