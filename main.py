@@ -115,7 +115,7 @@ class NLOCNode:
         payload = {"type": "encryptedPayload", "nonce": nonce.hex(), "ciphertext": ciphertext.hex()}
         self.sock.sendto(json.dumps(payload).encode(), self.peer_addr)
 
-def receive_loop(self):
+    def receive_loop(self):
         while True:
             try:
                 data, addr = self.sock.recvfrom(65535)
