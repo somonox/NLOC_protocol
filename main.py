@@ -139,6 +139,11 @@ class NLOCNode:
                 data, addr = self.sock.recvfrom(65535)
                 text = data.decode('utf-8', errors='ignore').strip()
 
+                print(f"\n[RAW DATA] {addr} 로부터 {len(data)}바이트 수신")
+                
+                text = data.decode('utf-8', errors='ignore').strip()
+                print(f"[RAW TEXT] 내용: {text}")
+
                 # 'hello' 수신 시 Host 역할 수행
                 if text == "hello":
                     self.peer_addr = addr
