@@ -8,80 +8,105 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, ec
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-# --- 핵심: 소켓 하나로 STUN과 P2P를 모두 처리 ---
+# --- 암호화 및 신원 인증 (이전과 동일) ---
+class NLOCCrypto:
+    def __init__(self):
+        self.private_key = ed25519.Ed25519PrivateKey.generate()
+        self.public_key = self.private_key.public_key()
+        self.ecdh_private = ec.generate_private_key(ec.SECP256R1())
+        self.session_key = None
+
+    def get_public_keys_hex(self):
+        pk_bytes = self.public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        ecdh_pk_bytes = self.ecdh_private.public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoints
+        )
+        return pk_bytes.hex(), ecdh_pk_bytes.hex()
+
+    def sign(self, message):
+        return self.private_key.sign(message.encode()).hex()
+
+    def compute_shared_secret(self, peer_ecdh_pk_hex):
+        peer_pk_bytes = bytes.fromhex(peer_ecdh_pk_hex)
+        peer_public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), peer_pk_bytes)
+        shared_secret = self.ecdh_private.exchange(ec.ECDH(), peer_public_key)
+        self.session_key = shared_secret[:32]
+        return self.ecdh_private.public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoints
+        ).hex()
+
+# --- STUN 직접 구현 ---
+def get_public_addr(sock):
+    stun_addr = ("stun.l.google.com", 19302)
+    sock.settimeout(2.0)
+    buf = bytearray(20)
+    buf[0:2] = [0x00, 0x01]
+    buf[4:8] = [0x21, 0x12, 0xA4, 0x42]
+    buf[8:20] = bytes(random.getrandbits(8) for _ in range(12))
+    try:
+        sock.sendto(buf, stun_addr)
+        data, _ = sock.recvfrom(1024)
+        pos = 20
+        while pos < len(data):
+            attr_type = struct.unpack('!H', data[pos:pos+2])[0]
+            attr_len = struct.unpack('!H', data[pos+2:pos+4])[0]
+            if attr_type in [0x0001, 0x0020]:
+                port = struct.unpack('!H', data[pos+6:pos+8])[0]
+                ip_bytes = list(data[pos+8:pos+12])
+                if attr_type == 0x0020:
+                    port ^= 0x2112
+                    for j in range(4): ip_bytes[j] ^= buf[4+j]
+                return ".".join(map(str, ip_bytes)), port
+            pos += 4 + attr_len
+    except: pass
+    return None, None
+
+# --- 메인 P2P 노드 ---
 class NLOCNode:
     def __init__(self):
-        # 1. 소켓 초기화 (재사용 옵션 활성화)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(('0.0.0.0', 0)) # 랜덤 포트 점유
-        
+        self.sock.bind(('0.0.0.0', 0))
         self.crypto = NLOCCrypto()
         self.peer_addr = None
         self.authenticated = False
         self.current_nonce = ""
-
-    def get_public_addr(self):
-        """Rust 소스에서 썼던 그 방식 그대로 직접 구현"""
-        stun_addr = ("stun.l.google.com", 19302)
-        self.sock.settimeout(2.0)
-        
-        # STUN Binding Request 조립
-        buf = bytearray(20)
-        buf[0:2] = [0x00, 0x01]
-        buf[4:8] = [0x21, 0x12, 0xA4, 0x42]
-        buf[8:20] = bytes(random.getrandbits(8) for _ in range(12))
-        
-        try:
-            self.sock.sendto(buf, stun_addr)
-            data, _ = self.sock.recvfrom(1024)
-            # XOR-MAPPED-ADDRESS 파싱
-            pos = 20
-            while pos < len(data):
-                attr_type = struct.unpack('!H', data[pos:pos+2])[0]
-                attr_len = struct.unpack('!H', data[pos+2:pos+4])[0]
-                if attr_type in [0x0001, 0x0020]:
-                    port = struct.unpack('!H', data[pos+6:pos+8])[0]
-                    ip_bytes = list(data[pos+8:pos+12])
-                    if attr_type == 0x0020:
-                        port ^= 0x2112
-                        for j in range(4): ip_bytes[j] ^= buf[4+j]
-                    return ".".join(map(str, ip_bytes)), port
-                pos += 4 + attr_len
-        except: pass
-        return None, None
+        self.local_port = self.sock.getsockname()[1]
 
     def start(self):
-        # 1. 내 주소 확보
-        ext_ip, ext_port = self.get_public_addr()
-        self.sock.settimeout(None) # 이후에는 무한 대기
+        # 1. 주소 확보
+        ext_ip, ext_port = get_public_addr(self.sock)
+        self.sock.settimeout(None) 
         
-        local_ip = socket.gethostbyname(socket.gethostname())
-        local_port = self.sock.getsockname()[1]
+        # 2. 하드코딩된 로컬 IP 사용
+        local_ip = "192.168.123.119"
 
+        print(f"\n🚀 NLOC P2P Node Started")
         print(f"🌍 [WAN] {ext_ip}:{ext_port}")
-        print(f"🏠 [LAN] {local_ip}:{local_port}")
+        print(f"🏠 [LAN] {local_ip}:{self.local_port}")
         print("-" * 50)
 
-        # 2. 수신 스레드 시작
         threading.Thread(target=self.receive_loop, daemon=True).start()
 
-        # 3. 입력 루프 (메인 스레드)
-        print("🔗 연결하려면 상대방 주소를 입력하세요 (또는 기다리세요)")
+        # 3. 입력 루프
+        print("🔗 상대방 주소를 입력하세요 (IP:Port)")
         try:
-            target_input = input("상대방 주소 (IP:Port): ").strip()
-            if target_input and ":" in target_input:
-                ip, port = target_input.split(":")
+            peer_input = input("입력: ").strip()
+            if peer_input and ":" in peer_input:
+                ip, port = peer_input.split(":")
                 self.peer_addr = (ip, int(port))
+                # 펀칭 시작
                 self.sock.sendto(b"hello", self.peer_addr)
-                print(f"🥊 {self.peer_addr}로 hello 전송!")
+                print(f"🥊 {self.peer_addr}로 'hello' 전송!")
 
             while True:
                 msg = input("")
                 if msg == "exit": break
                 if self.authenticated and self.crypto.session_key:
                     self.send_encrypted(msg)
-        except KeyboardInterrupt: pass
+                else:
+                    print("⚠️ 아직 인증 전입니다.")
+        except: pass
 
     def send_encrypted(self, msg):
         aesgcm = AESGCM(self.crypto.session_key)
@@ -94,52 +119,47 @@ class NLOCNode:
         while True:
             try:
                 data, addr = self.sock.recvfrom(65535)
-                raw_text = data.decode('utf-8', errors='ignore').strip()
+                text = data.decode('utf-8', errors='ignore').strip()
                 
-                # 'hello' 수신 처리
-                if raw_text == "hello":
-                    print(f"\n👋 hello 수신! (from {addr})")
+                if text == "hello":
                     self.peer_addr = addr
                     self.current_nonce = str(random.getrandbits(128))
                     challenge = {"type": "challenge", "nonce": self.current_nonce}
+                    print(f"\n📡 [수신] hello from {addr} -> Challenge 전송")
                     self.sock.sendto(json.dumps(challenge).encode(), addr)
                     continue
 
-                msg = json.loads(raw_text)
+                msg = json.loads(text)
                 m_type = msg.get("type")
 
                 if m_type == "challenge":
-                    print(f"📡 Challenge 수신! 응답 중...")
+                    print(f"\n📡 [수신] Challenge -> Response 전송")
                     self.current_nonce = msg['nonce']
                     pk, ecdh_pk = self.crypto.get_public_keys_hex()
-                    resp = {"type": "challengeResponse", "signature": self.crypto.sign(self.current_nonce), "publicKey": pk, "ecdhPublicKey": ecdh_pk}
-                    self.sock.sendto(json.dumps(resp).encode(), addr)
+                    response = {"type": "challengeResponse", "signature": self.crypto.sign(self.current_nonce), "publicKey": pk, "ecdhPublicKey": ecdh_pk}
+                    self.sock.sendto(json.dumps(response).encode(), addr)
 
                 elif m_type == "challengeResponse":
-                    print(f"🔐 Response 수신! 세션 키 생성 중...")
+                    print(f"\n📡 [수신] Response -> 검증 및 AuthSuccess 전송")
                     host_pub = self.crypto.compute_shared_secret(msg['ecdhPublicKey'])
                     success = {"type": "authSuccess", "ecdhPublicKey": host_pub}
                     self.sock.sendto(json.dumps(success).encode(), addr)
                     self.authenticated = True
                     self.peer_addr = addr
-                    print(f"✅ 인증 완료! 대화 시작 (Master)")
+                    print(f"✅ 인증 완료 (Master): {addr}")
 
                 elif m_type == "authSuccess":
                     self.crypto.compute_shared_secret(msg['ecdhPublicKey'])
                     self.authenticated = True
                     self.peer_addr = addr
-                    print(f"✅ 인증 완료! 대화 시작 (Slave)")
+                    print(f"✅ 인증 승인 (Slave): {addr}")
 
                 elif m_type == "encryptedPayload":
-                    aesgcm = AESGCM(self.crypto.session_key)
-                    dec = aesgcm.decrypt(bytes.fromhex(msg['nonce']), bytes.fromhex(msg['ciphertext']), None)
-                    print(f"\n🔐 [수신] {dec.decode()}")
-
+                    if self.crypto.session_key:
+                        aesgcm = AESGCM(self.crypto.session_key)
+                        dec = aesgcm.decrypt(bytes.fromhex(msg['nonce']), bytes.fromhex(msg['ciphertext']), None)
+                        print(f"\n🔐 [수신] {dec.decode()}")
             except: continue
 
-# --- 암호화 (NLOCCrypto 생략, 이전 코드와 동일) ---
-# (공간 절약을 위해 위에 기술된 NLOCCrypto 클래스를 그대로 사용하세요)
-
 if __name__ == "__main__":
-    node = NLOCNode()
-    node.start()
+    NLOCNode().start()
