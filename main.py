@@ -115,17 +115,20 @@ class NLOCNode:
         payload = {"type": "encryptedPayload", "nonce": nonce.hex(), "ciphertext": ciphertext.hex()}
         self.sock.sendto(json.dumps(payload).encode(), self.peer_addr)
 
-    def receive_loop(self):
+def receive_loop(self):
         while True:
             try:
                 data, addr = self.sock.recvfrom(65535)
                 text = data.decode('utf-8', errors='ignore').strip()
                 
+                # 1. RAW 데이터 확인 (이게 찍혀야 패킷이 온 것)
+                print(f"\n[DEBUG] 패킷 수신: {addr} -> {text[:50]}...")
+
                 if text == "hello":
                     self.peer_addr = addr
                     self.current_nonce = str(random.getrandbits(128))
                     challenge = {"type": "challenge", "nonce": self.current_nonce}
-                    print(f"\n📡 [수신] hello from {addr} -> Challenge 전송")
+                    print(f"📡 [Step 1] hello 수신 -> Challenge 전송")
                     self.sock.sendto(json.dumps(challenge).encode(), addr)
                     continue
 
@@ -133,33 +136,43 @@ class NLOCNode:
                 m_type = msg.get("type")
 
                 if m_type == "challenge":
-                    print(f"\n📡 [수신] Challenge -> Response 전송")
+                    print(f"📡 [Step 2] Challenge 수신 -> Response 생성 중...")
                     self.current_nonce = msg['nonce']
                     pk, ecdh_pk = self.crypto.get_public_keys_hex()
-                    response = {"type": "challengeResponse", "signature": self.crypto.sign(self.current_nonce), "publicKey": pk, "ecdhPublicKey": ecdh_pk}
+                    response = {
+                        "type": "challengeResponse", 
+                        "signature": self.crypto.sign(self.current_nonce), 
+                        "publicKey": pk, 
+                        "ecdhPublicKey": ecdh_pk
+                    }
+                    # 중요: 여기서 멈추면 안 됨! 바로 전송
                     self.sock.sendto(json.dumps(response).encode(), addr)
+                    print(f"📡 [Step 2] Response 전송 완료")
 
                 elif m_type == "challengeResponse":
-                    print(f"\n📡 [수신] Response -> 검증 및 AuthSuccess 전송")
+                    print(f"📡 [Step 3] Response 수신 -> 검증 시작")
                     host_pub = self.crypto.compute_shared_secret(msg['ecdhPublicKey'])
                     success = {"type": "authSuccess", "ecdhPublicKey": host_pub}
                     self.sock.sendto(json.dumps(success).encode(), addr)
                     self.authenticated = True
                     self.peer_addr = addr
-                    print(f"✅ 인증 완료 (Master): {addr}")
+                    print(f"✅ [Step 4] 인증 성공 (Host)")
 
                 elif m_type == "authSuccess":
                     self.crypto.compute_shared_secret(msg['ecdhPublicKey'])
                     self.authenticated = True
                     self.peer_addr = addr
-                    print(f"✅ 인증 승인 (Slave): {addr}")
+                    print(f"✅ [Step 4] 인증 완료 (Client)")
 
                 elif m_type == "encryptedPayload":
-                    if self.crypto.session_key:
-                        aesgcm = AESGCM(self.crypto.session_key)
-                        dec = aesgcm.decrypt(bytes.fromhex(msg['nonce']), bytes.fromhex(msg['ciphertext']), None)
-                        print(f"\n🔐 [수신] {dec.decode()}")
-            except: continue
+                    # ... 암호화 수신 로직 ...
+                    pass
 
+            except Exception as e:
+                print(f"❌ 루프 에러: {e}") # 여기서 에러 원인 파악 가능
+                continue
+
+# --- 실행 부분 ---
 if __name__ == "__main__":
-    NLOCNode().start()
+    node = NLOCNode()
+    node.start()
